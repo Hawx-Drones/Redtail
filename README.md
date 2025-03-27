@@ -219,7 +219,7 @@ netstat -tuln | grep 14540
 
 # Restart PX4 SITL
 cd ~/PX4-Autopilot
-make px4_sitl gazebo-classic_x500
+make px4_sitl gz_x500
 ```
 
 ### YOLO Detection Issues

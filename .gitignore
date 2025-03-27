@@ -55,7 +55,7 @@ noxfile/
 *.bak
 *.tmp
 
-/configs/**.json
+/_config/**.json
 
 models/
 checkpoints/
