@@ -74,15 +74,18 @@ make make px4_sitl gz_x500
 
 ```
 redtail.ai/
-├── drone_env.py            # RL environment interfacing with PX4
-├── yolo_detector.py        # YOLO object detection integration
-├── rtabmap_interface.py    # RTAB-Map SLAM integration
-├── ompl_integration.py     # OMPL path planning integration
-├── integration_script.py   # Main system integration script
-├── train_drone.py          # Training script for RL model
-├── models/                 # Saved RL models directory
-├── logs/                   # Training logs directory
-└── tensorboard/           # Tensorboard logs for training visualization
+├── src/
+│   ├── drone_env.py            # RL environment interfacing with PX4
+│   ├── yolo_detector.py        # YOLO object detection integration
+│   ├── rtabmap_interface.py    # RTAB-Map SLAM integration
+│   ├── ompl_integration.py     # OMPL path planning integration
+│   ├── integration_script.py   # Main system integration script
+│   └── train_drone.py          # Training script for RL model
+├── checkpoints/                # Trained RL model files (excluded from git)
+├── models/                     # Gazebo simulation models (3D objects, obstacles, props)
+├── worlds/                     # Simulation environments for training (air, ground, marine)
+├── logs/                       # Training logs directory
+└── tensorboard/                # Tensorboard logs for training visualization
 ```
 
 ## Usage
@@ -106,7 +109,7 @@ Training parameters:
 - `--no-gazebo`: Don't start Gazebo (if it's already running)
 - `--eval`: Evaluate model after training
 
-The training process will save model checkpoints in the `models/` directory.
+The training process will save model checkpoints in the `checkpoints/` directory.
 
 ### Deploying the Autonomous System
 
@@ -115,7 +118,7 @@ After training, you can deploy the system in different modes:
 #### 1. RL Mode (using the trained model)
 
 ```bash
-python integration_script.py --deploy --model models/best_model.zip
+python integration_script.py --deploy --model checkpoints/best_model.zip
 ```
 
 #### 2. Path Planning Mode (without RL)
@@ -143,7 +146,7 @@ To deploy on Jetson Orin Nano:
 4. Run the integration script in deployment mode:
 
 ```bash
-python integration_script.py --deploy --model models/best_model.zip --connection your_mavsdk_connection
+python integration_script.py --deploy --model checkpoints/best_model.zip --connection your_mavsdk_connection
 ```
 
 ## Visualization
@@ -178,6 +181,10 @@ def _check_collision(self, position):
     ]
     # ...
 ```
+
+Additionally, you can define custom environments in the `worlds/` folder and import Gazebo-compatible models into the 
+`models/` directory. These allow for configurable and domain-specific simulation setups (e.g., indoor, outdoor, 
+underwater).
 
 ### Implementing Custom Reward Functions
 
@@ -231,11 +238,12 @@ This repository includes:
 - Full training environment and reinforcement learning pipeline for autonomous drone navigation
 - Modular interfaces for YOLO-based object detection, RTAB-Map SLAM, and OMPL path planning
 - Simulation-ready training and deployment scripts using PX4 SITL and Gazebo
+- Expandable worlds/ and models/ directories for multi-domain simulation (drones, UGVs, marine robots, etc.)
 
 **Not included**:
 
 - Proprietary SDKs such as `HawxSDK` used for production drone deployments
-- Trained model weights (`models/` is excluded from this repo)
+- Trained model weights (the `checkpoints/` directory is excluded from version control)
 - Live flight control integrations or secure communication layers
 
 This open-source release is intended for **research, reproducibility, and community exploration** of drone autonomy.
