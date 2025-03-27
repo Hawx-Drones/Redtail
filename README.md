@@ -1,8 +1,8 @@
-# redtail.ai
+# Redtail
 
 A comprehensive autonomous drone navigation system that integrates reinforcement learning, object detection, SLAM, and path planning.
 
-> ⚠️ This repository is part of the open-source `redtail.ai` training stack.
+> ⚠️ This repository is part of the open-source `Redtail` training stack.
 > It does **not** include trained model weights, proprietary SDKs, or secure control interfaces used in commercial deployments.
 
 ## Architecture Overview
@@ -73,7 +73,7 @@ make make px4_sitl gz_x500
 ## Project Structure
 
 ```
-redtail.ai/
+Redtail/
 ├── src/
 │   ├── drone_env.py            # RL environment interfacing with PX4
 │   ├── yolo_detector.py        # YOLO object detection integration
