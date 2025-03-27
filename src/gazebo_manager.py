@@ -109,47 +109,12 @@ class GazeboManager:
                 print(f"Error accessing PX4 directory: {test_result.stderr}")
                 raise Exception(f"Cannot access PX4 directory: {self.px4_dir}")
 
-            if self.is_windows:
-                # Windows command might be different depending on PX4 setup
-                cmd = f"cd /d {self.px4_dir} && python Tools\\sitl_run.py --model x500"
-                kwargs = {}
-            else:
-                # Linux/Mac command
-                cmd = f"cd {self.px4_dir} && make px4_sitl gz_x500"
-                kwargs = {"preexec_fn": os.setsid}
-
-            print(f"Running command: {cmd}")
-            process = subprocess.Popen(
-                cmd,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                **kwargs
-            )
-            self.processes.append(process)
-
-            # Wait for startup and check for errors
-            time.sleep(5)
-
-            # Check if process is still running
-            if process.poll() is not None:
-                # Process exited, get error output
-                stdout, stderr = process.communicate()
-                stdout_str = stdout.decode('utf-8')
-                stderr_str = stderr.decode('utf-8')
-                print(f"Gazebo process exited early with code {process.returncode}")
-                print(f"STDOUT: {stdout_str}")
-                print(f"STDERR: {stderr_str}")
-
-                # Check for specific error about already running
-                if "already running" in stdout_str:
-                    print("PX4 server is already running. Attempting to stop and restart...")
-                    self.stop()
-                    # Try one more time after killing processes
-                    self.kill_existing_processes()
+            try:
+                process = self._init_process(wait_time=5)
+            except Exception as e:
+                if "PX4 server already running" in str(e):
                     return self.start_without_recursion()
-
-                raise Exception("Gazebo process failed to start")
+                raise
 
             # Wait additional time for full initialization
             print("Initial PX4/Gazebo process started, waiting for full initialization...")
@@ -163,7 +128,7 @@ class GazeboManager:
             # Clean up in the finally block
             raise
         finally:
-            # If there was an exception and we're not successfully running,
+            # If there was an exception, and we're not successfully running,
             # ensure all processes are cleaned up
             if not self.running:
                 print("Cleaning up after failed start...")
@@ -175,32 +140,10 @@ class GazeboManager:
         """Start without recursive calls - used after killing processes"""
         process = None
         try:
-            if self.is_windows:
-                cmd = f"cd /d {self.px4_dir} && python Tools\\sitl_run.py --model x500"
-                kwargs = {}
-            else:
-                cmd = f"cd {self.px4_dir} && make px4_sitl gz_x500"
-                kwargs = {"preexec_fn": os.setsid}
-
-            print(f"Retrying command: {cmd}")
-            process = subprocess.Popen(
-                cmd,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                **kwargs
-            )
-            self.processes.append(process)
-
-            # Wait for startup and check for errors
-            time.sleep(10)  # Wait a bit longer this time
-
-            # Check if process is still running
-            if process.poll() is not None:
-                stdout, stderr = process.communicate()
-                print(f"Second attempt: Gazebo process exited with code {process.returncode}")
-                print(f"STDOUT: {stdout.decode('utf-8')}")
-                print(f"STDERR: {stderr.decode('utf-8')}")
+            try:
+                process = self._init_process(wait_time=10)  # Wait a bit longer this time
+            except Exception as e:
+                print(f"Second attempt: {e}")
                 raise Exception("Gazebo process failed to start on second attempt")
 
             self.running = True
@@ -211,7 +154,7 @@ class GazeboManager:
             print(f"Failed on second attempt: {e}")
             raise
         finally:
-            # If there was an exception and we're not successfully running,
+            # If there was an exception, and we're not successfully running,
             # clean up processes
             if not self.running:
                 print("Cleaning up after failed second start...")
@@ -260,3 +203,57 @@ class GazeboManager:
             self.processes = []
             self.running = False
             print("PX4 SITL and Gazebo stopped")
+
+    def _init_process(self, wait_time=5):
+        """Helper method to initialize PX4/Gazebo subprocess
+
+        Args:
+            wait_time (int): Time to wait after starting the process in seconds
+
+        Returns:
+            subprocess.Popen: The initialized process
+
+        Raises:
+            Exception: If process fails to start properly
+        """
+        if self.is_windows:
+            cmd = f"cd /d {self.px4_dir} && python Tools\\sitl_run.py --model x500"
+            kwargs = {}
+        else:
+            cmd = f"cd {self.px4_dir} && make px4_sitl gz_x500"
+            kwargs = {"preexec_fn": os.setsid}
+
+        print(f"Running command: {cmd}")
+        process = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **kwargs
+        )
+        self.processes.append(process)
+
+        # Wait for startup and check for errors
+        time.sleep(wait_time)
+
+        # Check if process is still running
+        if process.poll() is not None:
+            # Process exited, get error output
+            stdout, stderr = process.communicate()
+            stdout_str = stdout.decode('utf-8')
+            stderr_str = stderr.decode('utf-8')
+            print(f"Gazebo process exited early with code {process.returncode}")
+            print(f"STDOUT: {stdout_str}")
+            print(f"STDERR: {stderr_str}")
+
+            # Check for specific error about already running
+            if "already running" in stdout_str:
+                print("PX4 server is already running. Attempting to stop and restart...")
+                self.stop()
+                # Try one more time after killing processes
+                self.kill_existing_processes()
+                raise Exception("PX4 server already running")
+
+            raise Exception("Gazebo process failed to start")
+
+        return process
