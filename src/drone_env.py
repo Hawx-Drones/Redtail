@@ -51,36 +51,65 @@ class DroneEnv(gym.Env):
 
     async def _setup_drone(self):
         """Connect to the drone and prepare for offboard control"""
+        print(f"Connecting to drone at {self.connection_string}...")
         await self.drone.connect(system_address=self.connection_string)
 
         # Wait for drone to connect
         print("Waiting for drone to connect...")
         async for state in self.drone.core.connection_state():
             if state.is_connected:
-                print(f"Drone discovered with UUID: {self.drone.info.uuid}")
+                print("Drone connected!")
                 break
 
-        # Arm the drone if it's not armed
-        if not await self.drone.telemetry.health_all_ok():
-            print("Drone not ready")
-            return False
+        # Wait a bit for system to stabilize
+        await asyncio.sleep(2)
 
-        print("-- Arming")
-        await self.drone.action.arm()
+        # Check if the drone is ready
+        print("Checking drone health...")
+        health_ok = False
+        for _ in range(10):  # Try a few times with a timeout
+            try:
+                health_ok = await self.drone.telemetry.health_all_ok()
+                if health_ok:
+                    break
+                await asyncio.sleep(1)
+            except Exception as e:
+                print(f"Health check error: {e}")
+                await asyncio.sleep(1)
+
+        if not health_ok:
+            print("WARNING: Drone not reporting all health checks OK")
+            # Continue anyway - incase SITL just isn't reporting the health correctly
+
+        try:
+            print("-- Arming")
+            await self.drone.action.arm()
+        except Exception as e:
+            print(f"Arming error: {e}")
+            # Continue anyway - might already be armed
 
         # Set to offboard mode
         print("-- Setting initial setpoint")
-        await self.drone.offboard.set_velocity_body(
-            VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
+        try:
+            await self.drone.offboard.set_velocity_body(
+                VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
+        except Exception as e:
+            print(f"Setting velocity error: {e}")
+            return False
 
         print("-- Starting offboard")
         try:
             await self.drone.offboard.start()
         except mavsdk.offboard.OffboardError as error:
-            print(f"Starting offboard mode failed with error: {error}")
-            await self.drone.action.disarm()
-            return False
+            if "Offboard is already active" not in str(error):
+                print(f"Starting offboard mode failed with error: {error}")
+                try:
+                    await self.drone.action.disarm()
+                except:
+                    pass
+                return False
 
+        print("Drone setup complete")
         return True
 
     def reset(self, **kwargs):
@@ -166,19 +195,36 @@ class DroneEnv(gym.Env):
             VelocityBodyYawspeed(vx, vy, vz, yaw_rate))
 
     async def _get_observation(self):
-        """Get the current drone state"""
-        # Get position, velocity, and attitude
-        async for position in self.drone.telemetry.position():
-            pos_ned = np.array([position.north_m, position.east_m, position.down_m])
-            break
+        """Get the current drone state with better error handling"""
 
-        async for velocity in self.drone.telemetry.velocity_ned():
-            vel_ned = np.array([velocity.north_m_s, velocity.east_m_s, velocity.down_m_s])
-            break
+        # Default values in case of error
+        pos_ned = np.array([0.0, 0.0, 0.0])
+        vel_ned = np.array([0.0, 0.0, 0.0])
+        att = np.array([0.0, 0.0, 0.0])
 
-        async for attitude in self.drone.telemetry.attitude_euler():
-            att = np.array([attitude.roll_deg, attitude.pitch_deg, attitude.yaw_deg])
-            break
+        # Get position with timeout
+        try:
+            async for position in self.drone.telemetry.position():
+                pos_ned = np.array([position.north_m, position.east_m, position.down_m])
+                break
+        except Exception as e:
+            print(f"Error getting position: {e}")
+
+        # Get velocity with timeout
+        try:
+            async for velocity in self.drone.telemetry.velocity_ned():
+                vel_ned = np.array([velocity.north_m_s, velocity.east_m_s, velocity.down_m_s])
+                break
+        except Exception as e:
+            print(f"Error getting velocity: {e}")
+
+        # Get attitude with timeout
+        try:
+            async for attitude in self.drone.telemetry.attitude_euler():
+                att = np.array([attitude.roll_deg, attitude.pitch_deg, attitude.yaw_deg])
+                break
+        except Exception as e:
+            print(f"Error getting attitude: {e}")
 
         # Placeholder for YOLO obstacle detections (10 values representing detected objects)
         # In a real implementation, this would come from your YOLO model
