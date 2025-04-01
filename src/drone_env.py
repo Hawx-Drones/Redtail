@@ -195,7 +195,7 @@ class DroneEnv(gym.Env):
             VelocityBodyYawspeed(vx, vy, vz, yaw_rate))
 
     async def _get_observation(self):
-        """Get the current drone state with better error handling"""
+        """Get the current drone state"""
 
         # Default values in case of error
         pos_ned = np.array([0.0, 0.0, 0.0])
@@ -205,7 +205,15 @@ class DroneEnv(gym.Env):
         # Get position with timeout
         try:
             async for position in self.drone.telemetry.position():
-                pos_ned = np.array([position.north_m, position.east_m, position.down_m])
+                try:
+                    # new MAVSDK API format
+                    if hasattr(position, 'north_m'):
+                        pos_ned = np.array([position.north_m, position.east_m, position.down_m])
+                    else:
+                        print(f"Position object attributes: {dir(position)}")
+                        return
+                except Exception as e:
+                    print(f"Error processing position attributes: {e}")
                 break
         except Exception as e:
             print(f"Error getting position: {e}")
@@ -213,7 +221,16 @@ class DroneEnv(gym.Env):
         # Get velocity with timeout
         try:
             async for velocity in self.drone.telemetry.velocity_ned():
-                vel_ned = np.array([velocity.north_m_s, velocity.east_m_s, velocity.down_m_s])
+                try:
+                    if hasattr(velocity, 'north_m_s'):
+                        vel_ned = np.array([velocity.north_m_s, velocity.east_m_s, velocity.down_m_s])
+                    elif hasattr(velocity, 'velocity_north_m_s'):
+                        vel_ned = np.array(
+                            [velocity.velocity_north_m_s, velocity.velocity_east_m_s, velocity.velocity_down_m_s])
+                    else:
+                        print(f"Velocity object attributes: {dir(velocity)}")
+                except Exception as e:
+                    print(f"Error processing velocity attributes: {e}")
                 break
         except Exception as e:
             print(f"Error getting velocity: {e}")
@@ -221,7 +238,20 @@ class DroneEnv(gym.Env):
         # Get attitude with timeout
         try:
             async for attitude in self.drone.telemetry.attitude_euler():
-                att = np.array([attitude.roll_deg, attitude.pitch_deg, attitude.yaw_deg])
+                try:
+                    if hasattr(attitude, 'roll_deg'):
+                        att = np.array([attitude.roll_deg, attitude.pitch_deg, attitude.yaw_deg])
+                    elif hasattr(attitude, 'roll'):
+                        # Convert radians to degrees if necessary
+                        att = np.array([
+                            np.degrees(attitude.roll),
+                            np.degrees(attitude.pitch),
+                            np.degrees(attitude.yaw)
+                        ])
+                    else:
+                        print(f"Attitude object attributes: {dir(attitude)}")
+                except Exception as e:
+                    print(f"Error processing attitude attributes: {e}")
                 break
         except Exception as e:
             print(f"Error getting attitude: {e}")
@@ -237,16 +267,43 @@ class DroneEnv(gym.Env):
     def _compute_reward(self, observation):
         """Calculate reward based on current state"""
         position = observation[:3]
-
-        # Distance to goal reward
-        distance_to_goal = np.linalg.norm(position - self.goal_position)
-        distance_reward = -distance_to_goal / 10.0  # Negative reward for distance
-
-        # Penalize unnecessary movement or energy consumption
         velocity = observation[3:6]
-        energy_penalty = -0.01 * np.sum(np.square(velocity))
 
-        return distance_reward + energy_penalty
+        # Distance to goal reward - scaled to be less severely negative
+        distance_to_goal = np.linalg.norm(position - self.goal_position)
+        max_possible_distance = np.linalg.norm(
+            np.array([100, 100, 100]) - self.goal_position)
+        normalized_distance = distance_to_goal / max_possible_distance  # Between 0 and 1
+        distance_reward = -10.0 * normalized_distance  # Scale between -10 and 0
+
+        # Progress reward - reward for getting closer to the goal
+        if hasattr(self, 'last_distance'):
+            progress = self.last_distance - distance_to_goal
+            progress_reward = 5.0 * progress  # Positive reward for getting closer
+        else:
+            progress_reward = 0.0
+        self.last_distance = distance_to_goal
+
+        # Penalize unnecessary movement or energy consumption (scaled to be less severe)
+        velocity_magnitude = np.linalg.norm(velocity)
+        energy_penalty = -0.1 * velocity_magnitude  # Linear penalty based on velocity magnitude
+
+        # Stability reward - small reward for maintaining level flight
+        attitude = observation[6:9]  # roll, pitch, yaw
+        stability_reward = 0.1 * (1.0 - min(1.0, np.sqrt(attitude[0] ** 2 + attitude[1] ** 2) / 90.0))
+
+        # Combine rewards
+        total_reward = distance_reward + progress_reward + energy_penalty + stability_reward
+
+        # Add small living penalty to encourage faster completion
+        living_penalty = -0.1
+
+        if self.current_step % 100 == 0:  # Print every 100 steps to avoid log spam
+            print(f"Rewards: distance={distance_reward:.2f}, progress={progress_reward:.2f}, "
+                  f"energy={energy_penalty:.2f}, stability={stability_reward:.2f}, "
+                  f"total={total_reward + living_penalty:.2f}")
+
+        return total_reward + living_penalty
 
     def _check_collision(self, position):
         """Check if drone has collided with obstacles"""
