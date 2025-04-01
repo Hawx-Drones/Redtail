@@ -36,6 +36,7 @@ class DroneEnv(gym.Env):
         self.connection_string = connection_string
         self.drone = System()
         self.loop = asyncio.get_event_loop()
+        self._is_connected = False
 
         # Episode parameters
         self.max_episode_steps = 1000
@@ -86,8 +87,14 @@ class DroneEnv(gym.Env):
         """Reset the drone to initial state"""
         self.current_step = 0
 
+        # Initialize connection if not already connected
+        if not hasattr(self, '_is_connected') or not self._is_connected:
+            success = self.loop.run_until_complete(self._setup_drone())
+            if not success:
+                raise RuntimeError("Failed to setup drone connection")
+            self._is_connected = True
+
         # Reset drone position in simulator
-        # For now, we'll just use the MAVSDK to return to home or land
         self.loop.run_until_complete(self._reset_drone())
 
         # Get initial observation
@@ -98,19 +105,29 @@ class DroneEnv(gym.Env):
 
     async def _reset_drone(self):
         """Reset the drone's position"""
-        # Return to launch/home position
-        await self.drone.action.return_to_launch()
-        # Wait for landing
-        await asyncio.sleep(5)
-        # Rearm and prepare for a new episode
-        await self.drone.action.arm()
-        await self.drone.offboard.set_velocity_body(
-            VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
         try:
-            await self.drone.offboard.start()
-        except:
-            # It's possible offboard is already active
-            pass
+            # Return to launch/home position
+            await self.drone.action.return_to_launch()
+            # Wait for landing
+            await asyncio.sleep(5)
+            # Rearm and prepare for a new episode
+            await self.drone.action.arm()
+            await self.drone.offboard.set_velocity_body(
+                VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
+            try:
+                await self.drone.offboard.start()
+            except mavsdk.offboard.OffboardError as error:
+                print(f"Starting offboard mode failed with error: {error}")
+                if "Offboard is already active" not in str(error):
+                    print("Failed to start offboard mode, attempting to continue anyway")
+        except Exception as e:
+            print(f"Error during drone reset: {e}")
+            # Try to recover by at least setting velocity to zero
+            try:
+                await self.drone.offboard.set_velocity_body(
+                    VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
+            except:
+                pass
 
     def step(self, action):
         """Execute action and return new state"""
@@ -212,6 +229,14 @@ class DroneEnv(gym.Env):
 
     async def _cleanup(self):
         """Land the drone and disconnect"""
-        print("-- Landing")
-        await self.drone.action.land()
-        await asyncio.sleep(5)  # Wait for landing
+        if not self._is_connected:
+            print("Drone wasn't connected, no cleanup needed")
+            return
+
+        try:
+            print("-- Landing")
+            await self.drone.action.land()
+            await asyncio.sleep(5)  # Wait for landing
+            self._is_connected = False
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
