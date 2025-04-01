@@ -13,6 +13,8 @@ import os
 import argparse
 import time
 import numpy as np
+import torch
+from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
@@ -21,6 +23,8 @@ from stable_baselines3.common.evaluation import evaluate_policy
 
 from drone_env import DroneEnv
 from gazebo_manager import GazeboManager
+from drone_feature_extractor import DroneFeatureExtractor
+from save_on_best_training_reward import SaveOnBestTrainingRewardCallback
 
 
 def load_px4_path_from_config():
@@ -48,102 +52,28 @@ def load_px4_path_from_config():
     return default_path
 
 
-class SaveOnBestTrainingRewardCallback(BaseCallback):
-    """Callback for saving model when reward improves"""
-
-    def __init__(self, check_freq, log_dir, verbose=1):
-        super(SaveOnBestTrainingRewardCallback, self).__init__(verbose)
-        self.check_freq = check_freq
-        self.log_dir = log_dir
-        self.save_path = os.path.join(log_dir, 'best_model')
-        self.best_mean_reward = -np.inf
-
-    def _init_callback(self) -> None:
-        if self.log_dir is not None:
-            os.makedirs(self.log_dir, exist_ok=True)
-
-    def _on_step(self) -> bool:
-        if self.n_calls % self.check_freq == 0:
-            # Check all possible keys that might contain episode rewards
-            possible_keys = [
-                'rollout/ep_rew_mean',  # Most common key
-                'ep_rew_mean',  # Alternative format
-                'episode_reward'  # Another possible format
-            ]
-
-            # Find the first key that exists in logger
-            reward_key = None
-            for key in possible_keys:
-                if key in self.model.logger.name_to_value:
-                    reward_key = key
-                    break
-
-            if reward_key is not None:
-                # Get the data for the available key
-                try:
-                    x, y = self.model.logger.name_to_value[reward_key]
-                    if len(x) > 0:
-                        # Mean training reward over the last 100 episodes
-                        mean_reward = y[-1]
-                        if self.verbose > 0:
-                            print(f"Num timesteps: {self.num_timesteps}")
-                            print(
-                                f"Best mean reward: {self.best_mean_reward:.2f} - Last mean reward: {mean_reward:.2f}")
-
-                        # New best model, save it
-                        if mean_reward > self.best_mean_reward:
-                            self.best_mean_reward = mean_reward
-                            if self.verbose > 0:
-                                print(f"Saving new best model to {self.save_path}")
-                            self.model.save(self.save_path)
-                except Exception as e:
-                    print(f"Error accessing reward data: {e}")
-            else:
-                # If no standard keys found, try to directly access statistics through model
-                try:
-                    # Try to access last episode rewards directly from rollout buffer
-                    if hasattr(self.model, 'rollout_buffer') and self.model.rollout_buffer is not None:
-                        if hasattr(self.model.rollout_buffer, 'rewards'):
-                            # Calculate mean reward from recent episodes
-                            recent_rewards = self.model.rollout_buffer.rewards
-                            if len(recent_rewards) > 0:
-                                mean_reward = float(np.mean(recent_rewards))
-                                if self.verbose > 0:
-                                    print(f"Num timesteps: {self.num_timesteps}")
-                                    print(
-                                        f"Best mean reward: {self.best_mean_reward:.2f} - Last mean reward (from buffer): {mean_reward:.2f}")
-
-                                # New best model, save it
-                                if mean_reward > self.best_mean_reward:
-                                    self.best_mean_reward = mean_reward
-                                    if self.verbose > 0:
-                                        print(f"Saving new best model to {self.save_path}")
-                                    self.model.save(self.save_path)
-                            else:
-                                print("No rewards found in rollout buffer")
-                        else:
-                            # Use any other available statistics
-                            if self.verbose > 0:
-                                print("Warning: Cannot find rewards in rollout buffer")
-                    else:
-                        if self.verbose > 0:
-                            print("Warning: No rollout buffer available to check rewards")
-                except Exception as e:
-                    print(f"Error accessing rollout buffer: {e}")
-                    if self.verbose > 0:
-                        print("Warning: Could not find any reward statistics")
-
-        return True
-
-
 def create_training_env(connection_string="udp://:14540", max_retries=3):
-    """Create and configure the training environment with retry logic"""
+    """Create and configure the training environment with retry logic and consistent data types"""
     for attempt in range(max_retries):
         try:
             print(f"Attempt {attempt + 1}/{max_retries} to create environment...")
 
             # Create the environment
             env = DroneEnv(connection_string=connection_string)
+
+            # Ensure observation and action spaces use consistent dtypes
+            env.observation_space = spaces.Box(
+                low=env.observation_space.low.astype(np.float32),
+                high=env.observation_space.high.astype(np.float32),
+                dtype=np.float32
+            )
+
+            env.action_space = spaces.Box(
+                low=env.action_space.low.astype(np.float32),
+                high=env.action_space.high.astype(np.float32),
+                dtype=np.float32
+            )
+
             # Test the environment with a reset to ensure the connection works
             env.reset()
 
@@ -170,19 +100,35 @@ def create_training_env(connection_string="udp://:14540", max_retries=3):
                 raise
 
 
-def train_model(env, timesteps=100000, save_dir="checkpoints", device="cpu"):
-    """Train the RL model with specified device"""
+def train_model(env, timesteps=100000, save_dir="checkpoints", device="cuda"):
+    """
+    Train the RL model with a custom feature extractor that handles
+    both drone state and YOLO detection data.
+    """
     os.makedirs(save_dir, exist_ok=True)
 
     # Create tensorboard log directory
     tensorboard_log = "./tensorboard/"
     os.makedirs(tensorboard_log, exist_ok=True)
 
+    # Check if CUDA is available
+    if device == "cuda" and not torch.cuda.is_available():
+        print("CUDA not available, falling back to CPU")
+        device = "cpu"
+
+    # Set consistent data type for both CPU and CUDA
+    torch_dtype = torch.float32  # Use single precision consistently
+
     print(f"Training model on device: {device}")
 
-    # Initialize the PPO model
+    if device == "cuda":
+        # Configure for CUDA stability but maintain performance
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cuda.matmul.allow_tf32 = False  # Disable TF32 for numerical consistency
+        torch.backends.cudnn.allow_tf32 = False
+
     model = PPO(
-        "MlpPolicy",
+        "CnnPolicy",
         env,
         verbose=1,
         tensorboard_log=tensorboard_log,
@@ -193,9 +139,21 @@ def train_model(env, timesteps=100000, save_dir="checkpoints", device="cpu"):
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.01,  # Encourage exploration
+        ent_coef=0.01,
+        max_grad_norm=0.5,
         device=device,
+        # Configure custom feature extractor
+        policy_kwargs={
+            "features_extractor_class": DroneFeatureExtractor,
+            "features_extractor_kwargs": {"features_dim": 128},
+            "optimizer_class": torch.optim.Adam,
+            "optimizer_kwargs": {"eps": 1e-5}
+        }
     )
+
+    # Ensure model weights are using consistent precision
+    for param in model.policy.parameters():
+        param.data = param.data.to(dtype=torch_dtype)
 
     # Setup callbacks
     checkpoint_callback = CheckpointCallback(
@@ -211,6 +169,12 @@ def train_model(env, timesteps=100000, save_dir="checkpoints", device="cpu"):
 
     # Start training
     print(f"Starting training for {timesteps} timesteps...")
+
+    # Set environment observation space to use consistent dtype
+    for i in range(len(env.observation_space.low)):
+        env.observation_space.low[i] = env.observation_space.low[i].astype(np.float32)
+        env.observation_space.high[i] = env.observation_space.high[i].astype(np.float32)
+
     model.learn(
         total_timesteps=timesteps,
         callback=[checkpoint_callback, reward_callback],
@@ -257,6 +221,8 @@ def main():
     parser.add_argument("--eval", action="store_true", help="Evaluate model after training")
     parser.add_argument("--stabilize-time", type=int, default=10,
                         help="Time to wait for simulation to stabilize (seconds)")
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="Device to train on ('cuda' for GPU, 'cpu' for CPU)")
     args = parser.parse_args()
 
     # Start Gazebo if needed
@@ -277,7 +243,7 @@ def main():
 
         # Train model
         print("\n===== Starting training =====")
-        model, model_path = train_model(env, args.timesteps)
+        model, model_path = train_model(env, args.timesteps, device=args.device)
 
         # Evaluate if requested
         if args.eval:

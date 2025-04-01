@@ -27,3 +27,5 @@ asyncio>=3.4.3
 
 # Utility
 tqdm>=4.62.0
+torch~=2.6.0
+stable_baselines3~=2.6.0

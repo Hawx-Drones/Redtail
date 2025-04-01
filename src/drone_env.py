@@ -195,26 +195,27 @@ class DroneEnv(gym.Env):
             VelocityBodyYawspeed(vx, vy, vz, yaw_rate))
 
     async def _get_observation(self):
-        """Get the current drone state"""
+        """Get the current drone state with consistent data types"""
 
         # Default values in case of error
-        pos_ned = np.array([0.0, 0.0, 0.0])
-        vel_ned = np.array([0.0, 0.0, 0.0])
-        att = np.array([0.0, 0.0, 0.0])
+        pos_ned = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        vel_ned = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        att = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
         # Get position with timeout
         try:
             async for position in self.drone.telemetry.position():
                 try:
-                    # new MAVSDK API format
                     if hasattr(position, 'north_m'):
-                        pos_ned = np.array([position.north_m, position.east_m, position.down_m])
+                        pos_ned = np.array([position.north_m, position.east_m, position.down_m], dtype=np.float32)
                     else:
-                        print(f"Position object attributes: {dir(position)}")
-                        return
+                        # Fallback for older or different MAVSDK data.
+                        # Just store zeros or do a lat/lon -> local NED transform.
+                        pos_ned = np.array([0.0, 0.0, 0.0], dtype=np.float32)  # or some default
                 except Exception as e:
                     print(f"Error processing position attributes: {e}")
                 break
+
         except Exception as e:
             print(f"Error getting position: {e}")
 
@@ -223,10 +224,12 @@ class DroneEnv(gym.Env):
             async for velocity in self.drone.telemetry.velocity_ned():
                 try:
                     if hasattr(velocity, 'north_m_s'):
-                        vel_ned = np.array([velocity.north_m_s, velocity.east_m_s, velocity.down_m_s])
+                        vel_ned = np.array([velocity.north_m_s, velocity.east_m_s, velocity.down_m_s], dtype=np.float32)
                     elif hasattr(velocity, 'velocity_north_m_s'):
                         vel_ned = np.array(
-                            [velocity.velocity_north_m_s, velocity.velocity_east_m_s, velocity.velocity_down_m_s])
+                            [velocity.velocity_north_m_s, velocity.velocity_east_m_s, velocity.velocity_down_m_s],
+                            dtype=np.float32
+                        )
                     else:
                         print(f"Velocity object attributes: {dir(velocity)}")
                 except Exception as e:
@@ -240,14 +243,14 @@ class DroneEnv(gym.Env):
             async for attitude in self.drone.telemetry.attitude_euler():
                 try:
                     if hasattr(attitude, 'roll_deg'):
-                        att = np.array([attitude.roll_deg, attitude.pitch_deg, attitude.yaw_deg])
+                        att = np.array([attitude.roll_deg, attitude.pitch_deg, attitude.yaw_deg], dtype=np.float32)
                     elif hasattr(attitude, 'roll'):
                         # Convert radians to degrees if necessary
                         att = np.array([
                             np.degrees(attitude.roll),
                             np.degrees(attitude.pitch),
                             np.degrees(attitude.yaw)
-                        ])
+                        ], dtype=np.float32)
                     else:
                         print(f"Attitude object attributes: {dir(attitude)}")
                 except Exception as e:
@@ -258,11 +261,11 @@ class DroneEnv(gym.Env):
 
         # Placeholder for YOLO obstacle detections (10 values representing detected objects)
         # In a real implementation, this would come from your YOLO model
-        yolo_detections = np.zeros(10)
+        yolo_detections = np.zeros(10, dtype=np.float32)
 
         # Combine all observations
         observation = np.concatenate([pos_ned, vel_ned, att, yolo_detections])
-        return observation
+        return observation.astype(np.float32)  # Ensure consistent float32 type
 
     def _compute_reward(self, observation):
         """Calculate reward based on current state"""
