@@ -204,43 +204,54 @@ def main():
     parser = argparse.ArgumentParser(description="Train an autonomous drone RL model")
     parser.add_argument("--timesteps", type=int, default=100000, help="Total training timesteps")
     parser.add_argument("--connection", type=str, default="udp://:14540", help="MAVSDK connection string")
-    parser.add_argument("--px4-dir", type=str, default=px4_default_dir, help="PX4 directory (default from config or ~/PX4-Autopilot)")
+    parser.add_argument("--px4-dir", type=str, default=px4_default_dir,
+                        help="PX4 directory (default from config or ~/PX4-Autopilot)")
     parser.add_argument("--no-gazebo", action="store_true", help="Don't start Gazebo (assumes it's already running)")
     parser.add_argument("--eval", action="store_true", help="Evaluate model after training")
+    parser.add_argument("--stabilize-time", type=int, default=10,
+                        help="Time to wait for simulation to stabilize (seconds)")
     args = parser.parse_args()
 
     # Start Gazebo if needed
     gazebo_manager = None
     if not args.no_gazebo:
+        print("\n===== Starting Gazebo Simulation =====")
         gazebo_manager = GazeboManager(px4_dir=args.px4_dir)
         gazebo_manager.start()
 
     try:
         # Wait for Gazebo and PX4 to initialize
-        print("Waiting for simulation to stabilize...")
-        time.sleep(5)
+        print(f"\n===== Waiting {args.stabilize_time} seconds for simulation to stabilize =====")
+        time.sleep(args.stabilize_time)
 
         # Create environment
-        print("Creating training environment...")
+        print("\n===== Creating training environment =====")
         env = create_training_env(args.connection)
 
         # Train model
+        print("\n===== Starting training =====")
         model, model_path = train_model(env, args.timesteps)
 
         # Evaluate if requested
         if args.eval:
             evaluate_model(model, env)
 
-        print(f"Training complete! Model saved to {model_path}")
+        print(f"\n===== Training complete! Model saved to {model_path} =====")
 
     except KeyboardInterrupt:
-        print("Training interrupted by user")
+        print("\n===== Training interrupted by user =====")
     except Exception as e:
-        print(f"Error during training: {e}")
+        print(f"\n===== Error during training: {e} =====")
+        import traceback
+        traceback.print_exc()
     finally:
         # Clean up
+        print("\n===== Cleaning up =====")
         if 'env' in locals():
-            env.close()
+            try:
+                env.close()
+            except Exception as e:
+                print(f"Error closing environment: {e}")
 
         if gazebo_manager:
             gazebo_manager.stop()
