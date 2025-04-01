@@ -64,50 +64,121 @@ class SaveOnBestTrainingRewardCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         if self.n_calls % self.check_freq == 0:
-            # Retrieve training reward
-            x, y = self.model.logger.name_to_value['rollout/ep_rew_mean']
-            if len(x) > 0:
-                # Mean training reward over the last 100 episodes
-                mean_reward = y[-1]
-                if self.verbose > 0:
-                    print(f"Num timesteps: {self.num_timesteps}")
-                    print(f"Best mean reward: {self.best_mean_reward:.2f} - Last mean reward: {mean_reward:.2f}")
+            # Check all possible keys that might contain episode rewards
+            possible_keys = [
+                'rollout/ep_rew_mean',  # Most common key
+                'ep_rew_mean',  # Alternative format
+                'episode_reward'  # Another possible format
+            ]
 
-                # New best model, save it
-                if mean_reward > self.best_mean_reward:
-                    self.best_mean_reward = mean_reward
+            # Find the first key that exists in logger
+            reward_key = None
+            for key in possible_keys:
+                if key in self.model.logger.name_to_value:
+                    reward_key = key
+                    break
+
+            if reward_key is not None:
+                # Get the data for the available key
+                try:
+                    x, y = self.model.logger.name_to_value[reward_key]
+                    if len(x) > 0:
+                        # Mean training reward over the last 100 episodes
+                        mean_reward = y[-1]
+                        if self.verbose > 0:
+                            print(f"Num timesteps: {self.num_timesteps}")
+                            print(
+                                f"Best mean reward: {self.best_mean_reward:.2f} - Last mean reward: {mean_reward:.2f}")
+
+                        # New best model, save it
+                        if mean_reward > self.best_mean_reward:
+                            self.best_mean_reward = mean_reward
+                            if self.verbose > 0:
+                                print(f"Saving new best model to {self.save_path}")
+                            self.model.save(self.save_path)
+                except Exception as e:
+                    print(f"Error accessing reward data: {e}")
+            else:
+                # If no standard keys found, try to directly access statistics through model
+                try:
+                    # Try to access last episode rewards directly from rollout buffer
+                    if hasattr(self.model, 'rollout_buffer') and self.model.rollout_buffer is not None:
+                        if hasattr(self.model.rollout_buffer, 'rewards'):
+                            # Calculate mean reward from recent episodes
+                            recent_rewards = self.model.rollout_buffer.rewards
+                            if len(recent_rewards) > 0:
+                                mean_reward = float(np.mean(recent_rewards))
+                                if self.verbose > 0:
+                                    print(f"Num timesteps: {self.num_timesteps}")
+                                    print(
+                                        f"Best mean reward: {self.best_mean_reward:.2f} - Last mean reward (from buffer): {mean_reward:.2f}")
+
+                                # New best model, save it
+                                if mean_reward > self.best_mean_reward:
+                                    self.best_mean_reward = mean_reward
+                                    if self.verbose > 0:
+                                        print(f"Saving new best model to {self.save_path}")
+                                    self.model.save(self.save_path)
+                            else:
+                                print("No rewards found in rollout buffer")
+                        else:
+                            # Use any other available statistics
+                            if self.verbose > 0:
+                                print("Warning: Cannot find rewards in rollout buffer")
+                    else:
+                        if self.verbose > 0:
+                            print("Warning: No rollout buffer available to check rewards")
+                except Exception as e:
+                    print(f"Error accessing rollout buffer: {e}")
                     if self.verbose > 0:
-                        print(f"Saving new best model to {self.save_path}")
-                    self.model.save(self.save_path)
+                        print("Warning: Could not find any reward statistics")
 
         return True
 
 
-def create_training_env(connection_string="udp://:14540"):
-    """Create and configure the training environment"""
-    env = DroneEnv(connection_string=connection_string)
+def create_training_env(connection_string="udp://:14540", max_retries=3):
+    """Create and configure the training environment with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            print(f"Attempt {attempt + 1}/{max_retries} to create environment...")
 
-    # Wrap with monitoring for logging
-    log_dir = "../logs"
-    os.makedirs(log_dir, exist_ok=True)
-    env = Monitor(env, log_dir)
+            # Create the environment
+            env = DroneEnv(connection_string=connection_string)
+            # Test the environment with a reset to ensure the connection works
+            env.reset()
 
-    # Use vectorized environment (even for single env)
-    env = DummyVecEnv([lambda: env])
+            log_dir = "../logs"
+            os.makedirs(log_dir, exist_ok=True)
+            env = Monitor(env, log_dir)
 
-    # Normalize observations and rewards
-    env = VecNormalize(env, norm_obs=True, norm_reward=True)
+            # Use vectorized environment (even for single env)
+            env = DummyVecEnv([lambda: env])
 
-    return env
+            # Normalize observations and rewards
+            env = VecNormalize(env, norm_obs=True, norm_reward=True)
+
+            print("Environment created successfully!")
+            return env
+
+        except Exception as e:
+            print(f"Error creating environment (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                print("Waiting 5 seconds before next attempt...")
+                time.sleep(5)
+            else:
+                print("Maximum retry attempts reached. Could not create environment.")
+                raise
 
 
-def train_model(env, timesteps=100000, save_dir="checkpoints"):
-    """Train the RL model"""
+def train_model(env, timesteps=100000, save_dir="checkpoints", device="cpu"):
+    """Train the RL model with specified device"""
     os.makedirs(save_dir, exist_ok=True)
 
     # Create tensorboard log directory
     tensorboard_log = "./tensorboard/"
     os.makedirs(tensorboard_log, exist_ok=True)
+
+    print(f"Training model on device: {device}")
 
     # Initialize the PPO model
     model = PPO(
@@ -123,6 +194,7 @@ def train_model(env, timesteps=100000, save_dir="checkpoints"):
         gae_lambda=0.95,
         clip_range=0.2,
         ent_coef=0.01,  # Encourage exploration
+        device=device,
     )
 
     # Setup callbacks
@@ -179,43 +251,54 @@ def main():
     parser = argparse.ArgumentParser(description="Train an autonomous drone RL model")
     parser.add_argument("--timesteps", type=int, default=100000, help="Total training timesteps")
     parser.add_argument("--connection", type=str, default="udp://:14540", help="MAVSDK connection string")
-    parser.add_argument("--px4-dir", type=str, default=px4_default_dir, help="PX4 directory (default from config or ~/PX4-Autopilot)")
+    parser.add_argument("--px4-dir", type=str, default=px4_default_dir,
+                        help="PX4 directory (default from config or ~/PX4-Autopilot)")
     parser.add_argument("--no-gazebo", action="store_true", help="Don't start Gazebo (assumes it's already running)")
     parser.add_argument("--eval", action="store_true", help="Evaluate model after training")
+    parser.add_argument("--stabilize-time", type=int, default=10,
+                        help="Time to wait for simulation to stabilize (seconds)")
     args = parser.parse_args()
 
     # Start Gazebo if needed
     gazebo_manager = None
     if not args.no_gazebo:
+        print("\n===== Starting Gazebo Simulation =====")
         gazebo_manager = GazeboManager(px4_dir=args.px4_dir)
         gazebo_manager.start()
 
     try:
         # Wait for Gazebo and PX4 to initialize
-        print("Waiting for simulation to stabilize...")
-        time.sleep(5)
+        print(f"\n===== Waiting {args.stabilize_time} seconds for simulation to stabilize =====")
+        time.sleep(args.stabilize_time)
 
         # Create environment
-        print("Creating training environment...")
+        print("\n===== Creating training environment =====")
         env = create_training_env(args.connection)
 
         # Train model
+        print("\n===== Starting training =====")
         model, model_path = train_model(env, args.timesteps)
 
         # Evaluate if requested
         if args.eval:
             evaluate_model(model, env)
 
-        print(f"Training complete! Model saved to {model_path}")
+        print(f"\n===== Training complete! Model saved to {model_path} =====")
 
     except KeyboardInterrupt:
-        print("Training interrupted by user")
+        print("\n===== Training interrupted by user =====")
     except Exception as e:
-        print(f"Error during training: {e}")
+        print(f"\n===== Error during training: {e} =====")
+        import traceback
+        traceback.print_exc()
     finally:
         # Clean up
+        print("\n===== Cleaning up =====")
         if 'env' in locals():
-            env.close()
+            try:
+                env.close()
+            except Exception as e:
+                print(f"Error closing environment: {e}")
 
         if gazebo_manager:
             gazebo_manager.stop()

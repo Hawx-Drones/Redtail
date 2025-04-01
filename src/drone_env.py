@@ -36,6 +36,7 @@ class DroneEnv(gym.Env):
         self.connection_string = connection_string
         self.drone = System()
         self.loop = asyncio.get_event_loop()
+        self._is_connected = False
 
         # Episode parameters
         self.max_episode_steps = 1000
@@ -50,44 +51,79 @@ class DroneEnv(gym.Env):
 
     async def _setup_drone(self):
         """Connect to the drone and prepare for offboard control"""
+        print(f"Connecting to drone at {self.connection_string}...")
         await self.drone.connect(system_address=self.connection_string)
 
         # Wait for drone to connect
         print("Waiting for drone to connect...")
         async for state in self.drone.core.connection_state():
             if state.is_connected:
-                print(f"Drone discovered with UUID: {self.drone.info.uuid}")
+                print("Drone connected!")
                 break
 
-        # Arm the drone if it's not armed
-        if not await self.drone.telemetry.health_all_ok():
-            print("Drone not ready")
-            return False
+        # Wait a bit for system to stabilize
+        await asyncio.sleep(2)
 
-        print("-- Arming")
-        await self.drone.action.arm()
+        # Check if the drone is ready
+        print("Checking drone health...")
+        health_ok = False
+        for _ in range(10):  # Try a few times with a timeout
+            try:
+                health_ok = await self.drone.telemetry.health_all_ok()
+                if health_ok:
+                    break
+                await asyncio.sleep(1)
+            except Exception as e:
+                print(f"Health check error: {e}")
+                await asyncio.sleep(1)
+
+        if not health_ok:
+            print("WARNING: Drone not reporting all health checks OK")
+            # Continue anyway - incase SITL just isn't reporting the health correctly
+
+        try:
+            print("-- Arming")
+            await self.drone.action.arm()
+        except Exception as e:
+            print(f"Arming error: {e}")
+            # Continue anyway - might already be armed
 
         # Set to offboard mode
         print("-- Setting initial setpoint")
-        await self.drone.offboard.set_velocity_body(
-            VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
+        try:
+            await self.drone.offboard.set_velocity_body(
+                VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
+        except Exception as e:
+            print(f"Setting velocity error: {e}")
+            return False
 
         print("-- Starting offboard")
         try:
             await self.drone.offboard.start()
         except mavsdk.offboard.OffboardError as error:
-            print(f"Starting offboard mode failed with error: {error}")
-            await self.drone.action.disarm()
-            return False
+            if "Offboard is already active" not in str(error):
+                print(f"Starting offboard mode failed with error: {error}")
+                try:
+                    await self.drone.action.disarm()
+                except:
+                    pass
+                return False
 
+        print("Drone setup complete")
         return True
 
     def reset(self, **kwargs):
         """Reset the drone to initial state"""
         self.current_step = 0
 
+        # Initialize connection if not already connected
+        if not hasattr(self, '_is_connected') or not self._is_connected:
+            success = self.loop.run_until_complete(self._setup_drone())
+            if not success:
+                raise RuntimeError("Failed to setup drone connection")
+            self._is_connected = True
+
         # Reset drone position in simulator
-        # For now, we'll just use the MAVSDK to return to home or land
         self.loop.run_until_complete(self._reset_drone())
 
         # Get initial observation
@@ -98,19 +134,29 @@ class DroneEnv(gym.Env):
 
     async def _reset_drone(self):
         """Reset the drone's position"""
-        # Return to launch/home position
-        await self.drone.action.return_to_launch()
-        # Wait for landing
-        await asyncio.sleep(5)
-        # Rearm and prepare for a new episode
-        await self.drone.action.arm()
-        await self.drone.offboard.set_velocity_body(
-            VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
         try:
-            await self.drone.offboard.start()
-        except:
-            # It's possible offboard is already active
-            pass
+            # Return to launch/home position
+            await self.drone.action.return_to_launch()
+            # Wait for landing
+            await asyncio.sleep(5)
+            # Rearm and prepare for a new episode
+            await self.drone.action.arm()
+            await self.drone.offboard.set_velocity_body(
+                VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
+            try:
+                await self.drone.offboard.start()
+            except mavsdk.offboard.OffboardError as error:
+                print(f"Starting offboard mode failed with error: {error}")
+                if "Offboard is already active" not in str(error):
+                    print("Failed to start offboard mode, attempting to continue anyway")
+        except Exception as e:
+            print(f"Error during drone reset: {e}")
+            # Try to recover by at least setting velocity to zero
+            try:
+                await self.drone.offboard.set_velocity_body(
+                    VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
+            except:
+                pass
 
     def step(self, action):
         """Execute action and return new state"""
@@ -150,18 +196,65 @@ class DroneEnv(gym.Env):
 
     async def _get_observation(self):
         """Get the current drone state"""
-        # Get position, velocity, and attitude
-        async for position in self.drone.telemetry.position():
-            pos_ned = np.array([position.north_m, position.east_m, position.down_m])
-            break
 
-        async for velocity in self.drone.telemetry.velocity_ned():
-            vel_ned = np.array([velocity.north_m_s, velocity.east_m_s, velocity.down_m_s])
-            break
+        # Default values in case of error
+        pos_ned = np.array([0.0, 0.0, 0.0])
+        vel_ned = np.array([0.0, 0.0, 0.0])
+        att = np.array([0.0, 0.0, 0.0])
 
-        async for attitude in self.drone.telemetry.attitude_euler():
-            att = np.array([attitude.roll_deg, attitude.pitch_deg, attitude.yaw_deg])
-            break
+        # Get position with timeout
+        try:
+            async for position in self.drone.telemetry.position():
+                try:
+                    # new MAVSDK API format
+                    if hasattr(position, 'north_m'):
+                        pos_ned = np.array([position.north_m, position.east_m, position.down_m])
+                    else:
+                        print(f"Position object attributes: {dir(position)}")
+                        return
+                except Exception as e:
+                    print(f"Error processing position attributes: {e}")
+                break
+        except Exception as e:
+            print(f"Error getting position: {e}")
+
+        # Get velocity with timeout
+        try:
+            async for velocity in self.drone.telemetry.velocity_ned():
+                try:
+                    if hasattr(velocity, 'north_m_s'):
+                        vel_ned = np.array([velocity.north_m_s, velocity.east_m_s, velocity.down_m_s])
+                    elif hasattr(velocity, 'velocity_north_m_s'):
+                        vel_ned = np.array(
+                            [velocity.velocity_north_m_s, velocity.velocity_east_m_s, velocity.velocity_down_m_s])
+                    else:
+                        print(f"Velocity object attributes: {dir(velocity)}")
+                except Exception as e:
+                    print(f"Error processing velocity attributes: {e}")
+                break
+        except Exception as e:
+            print(f"Error getting velocity: {e}")
+
+        # Get attitude with timeout
+        try:
+            async for attitude in self.drone.telemetry.attitude_euler():
+                try:
+                    if hasattr(attitude, 'roll_deg'):
+                        att = np.array([attitude.roll_deg, attitude.pitch_deg, attitude.yaw_deg])
+                    elif hasattr(attitude, 'roll'):
+                        # Convert radians to degrees if necessary
+                        att = np.array([
+                            np.degrees(attitude.roll),
+                            np.degrees(attitude.pitch),
+                            np.degrees(attitude.yaw)
+                        ])
+                    else:
+                        print(f"Attitude object attributes: {dir(attitude)}")
+                except Exception as e:
+                    print(f"Error processing attitude attributes: {e}")
+                break
+        except Exception as e:
+            print(f"Error getting attitude: {e}")
 
         # Placeholder for YOLO obstacle detections (10 values representing detected objects)
         # In a real implementation, this would come from your YOLO model
@@ -174,16 +267,43 @@ class DroneEnv(gym.Env):
     def _compute_reward(self, observation):
         """Calculate reward based on current state"""
         position = observation[:3]
-
-        # Distance to goal reward
-        distance_to_goal = np.linalg.norm(position - self.goal_position)
-        distance_reward = -distance_to_goal / 10.0  # Negative reward for distance
-
-        # Penalize unnecessary movement or energy consumption
         velocity = observation[3:6]
-        energy_penalty = -0.01 * np.sum(np.square(velocity))
 
-        return distance_reward + energy_penalty
+        # Distance to goal reward - scaled to be less severely negative
+        distance_to_goal = np.linalg.norm(position - self.goal_position)
+        max_possible_distance = np.linalg.norm(
+            np.array([100, 100, 100]) - self.goal_position)
+        normalized_distance = distance_to_goal / max_possible_distance  # Between 0 and 1
+        distance_reward = -10.0 * normalized_distance  # Scale between -10 and 0
+
+        # Progress reward - reward for getting closer to the goal
+        if hasattr(self, 'last_distance'):
+            progress = self.last_distance - distance_to_goal
+            progress_reward = 5.0 * progress  # Positive reward for getting closer
+        else:
+            progress_reward = 0.0
+        self.last_distance = distance_to_goal
+
+        # Penalize unnecessary movement or energy consumption (scaled to be less severe)
+        velocity_magnitude = np.linalg.norm(velocity)
+        energy_penalty = -0.1 * velocity_magnitude  # Linear penalty based on velocity magnitude
+
+        # Stability reward - small reward for maintaining level flight
+        attitude = observation[6:9]  # roll, pitch, yaw
+        stability_reward = 0.1 * (1.0 - min(1.0, np.sqrt(attitude[0] ** 2 + attitude[1] ** 2) / 90.0))
+
+        # Combine rewards
+        total_reward = distance_reward + progress_reward + energy_penalty + stability_reward
+
+        # Add small living penalty to encourage faster completion
+        living_penalty = -0.1
+
+        if self.current_step % 100 == 0:  # Print every 100 steps to avoid log spam
+            print(f"Rewards: distance={distance_reward:.2f}, progress={progress_reward:.2f}, "
+                  f"energy={energy_penalty:.2f}, stability={stability_reward:.2f}, "
+                  f"total={total_reward + living_penalty:.2f}")
+
+        return total_reward + living_penalty
 
     def _check_collision(self, position):
         """Check if drone has collided with obstacles"""
@@ -212,6 +332,14 @@ class DroneEnv(gym.Env):
 
     async def _cleanup(self):
         """Land the drone and disconnect"""
-        print("-- Landing")
-        await self.drone.action.land()
-        await asyncio.sleep(5)  # Wait for landing
+        if not self._is_connected:
+            print("Drone wasn't connected, no cleanup needed")
+            return
+
+        try:
+            print("-- Landing")
+            await self.drone.action.land()
+            await asyncio.sleep(5)  # Wait for landing
+            self._is_connected = False
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
